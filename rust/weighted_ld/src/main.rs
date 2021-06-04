@@ -1,12 +1,7 @@
 use human_format::Formatter;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, log_enabled, Level};
-use std::{
-    fs::File,
-    io::{BufWriter, Write},
-    path::PathBuf,
-    time::Instant,
-};
+use std::{fs::File, io::{BufReader, BufWriter, Write}, path::PathBuf, time::Instant};
 use structopt::StructOpt;
 
 use weighted_ld::*;
@@ -126,8 +121,9 @@ fn main() -> Result<(), std::io::Error> {
     debug!("{:?}", opt);
 
     let sw = Instant::now();
-    let multiseq = read_fasta(opt.fasta_input)?;
-    let siteset = SiteSet::from_multiseq(&multiseq);
+    
+    let multiseq = read_fasta(File::open(opt.fasta_input)?)?;
+    let siteset = SiteSet::from_sequences(&multiseq);
     info!("Loaded fasta file in {:?}", sw.elapsed());
     info!(
         "    {} sequences, {} sites",

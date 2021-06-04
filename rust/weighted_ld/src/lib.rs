@@ -1,9 +1,6 @@
 use std::{
-    fs::File,
-    io::{BufRead, BufReader},
-    iter::Sum,
+    io::{BufRead, BufReader, Read},
     ops::{Index, IndexMut},
-    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Mutex,
@@ -80,9 +77,7 @@ impl IndexMut<Symbol> for SymbolHistogram {
 
 impl SymbolHistogram {
     fn zero() -> Self {
-        Self {
-            data: [0; 6],
-        }
+        Self { data: [0; 6] }
     }
 
     fn from_slice(symbols: &[Symbol]) -> Self {
@@ -102,15 +97,15 @@ impl SymbolHistogram {
         use Symbol::*;
         self[A] + self[C] + self[G] + self[T] + self[Missing]
     }
-    
+
     fn distinct_known_count(&self) -> usize {
         use Symbol::*;
 
-        (if self[A] > 0 { 1usize } else { 0 }) +
-        if self[C] > 0 { 1 } else { 0 } +
-        if self[G] > 0 { 1 } else { 0 } +
-        if self[T] > 0 { 1 } else { 0 } +
-        if self[Missing] > 0 { 1 } else { 0 }
+        (if self[A] > 0 { 1usize } else { 0 })
+            + if self[C] > 0 { 1 } else { 0 }
+            + if self[G] > 0 { 1 } else { 0 }
+            + if self[T] > 0 { 1 } else { 0 }
+            + if self[Missing] > 0 { 1 } else { 0 }
     }
 
     fn major_minor_symbols(&self) -> (Option<Symbol>, Option<Symbol>) {
@@ -133,16 +128,6 @@ impl SymbolHistogram {
 pub struct Sequence {
     pub name: Option<String>,
     pub symbols: Vec<Symbol>,
-}
-
-pub enum MultiSequenceSource {
-    FastaFile(PathBuf),
-    None,
-}
-
-pub struct MultiSequence {
-    pub source: MultiSequenceSource,
-    pub sequences: Vec<Sequence>,
 }
 
 /// Stores symbol data such that all data for a given site is contiguous
@@ -169,11 +154,11 @@ impl Index<usize> for SiteSet {
 }
 
 impl SiteSet {
-    pub fn from_multiseq(ms: &MultiSequence) -> Self {
-        let n_seqs = ms.sequences.len();
-        let n_sites = ms.sequences[0].symbols.len();
+    pub fn from_sequences(sequences: &[Sequence]) -> Self {
+        let n_seqs = sequences.len();
+        let n_sites = sequences[0].symbols.len();
 
-        if ms.sequences.iter().any(|s| s.symbols.len() != n_sites) {
+        if sequences.iter().any(|s| s.symbols.len() != n_sites) {
             panic!("Not all sequences have the same number of symbols");
         }
 
@@ -182,7 +167,7 @@ impl SiteSet {
 
         for site in 0..n_sites {
             for seq in 0..n_seqs {
-                buffer[site * n_seqs + seq] = ms.sequences[seq].symbols[site];
+                buffer[site * n_seqs + seq] = sequences[seq].symbols[site];
             }
         }
 
@@ -198,22 +183,14 @@ impl SiteSet {
     pub fn from_strs(raw: &[&str]) -> Self {
         let sequences = raw
             .iter()
-            .map(|seq_str| {
-                seq_str
-                    .chars()
-                    .map(Symbol::from)
-                    .collect::<Vec<_>>()
-            })
+            .map(|seq_str| seq_str.chars().map(Symbol::from).collect::<Vec<_>>())
             .map(|symbols| Sequence {
                 name: None,
                 symbols,
             })
             .collect::<Vec<Sequence>>();
 
-        Self::from_multiseq(&MultiSequence {
-            source: MultiSequenceSource::None,
-            sequences,
-        })
+        Self::from_sequences(&sequences)
     }
 
     pub fn filter_by(&self, filter_func: impl Fn(&[Symbol]) -> bool) -> Self {
@@ -251,13 +228,9 @@ impl SiteSet {
     }
 }
 
-pub fn read_fasta<P: AsRef<Path>>(path: P) -> Result<MultiSequence, std::io::Error> {
-    let source = MultiSequenceSource::FastaFile(path.as_ref().to_path_buf());
+pub fn read_fasta(reader: impl Read) -> Result<Vec<Sequence>, std::io::Error> {
+    let mut reader = BufReader::new(reader);
     let mut sequences = Vec::new();
-
-    let file = File::open(path.as_ref())?;
-    let mut reader = BufReader::new(file);
-
     let mut line = String::new();
     let mut name = None;
 
@@ -267,11 +240,13 @@ pub fn read_fasta<P: AsRef<Path>>(path: P) -> Result<MultiSequence, std::io::Err
         if bytes_read == 0 {
             break;
         }
+        
+        let line_trimmed = line.trim();
 
-        if let Some(new_name) = line.strip_prefix(">") {
+        if let Some(new_name) = line_trimmed.strip_prefix(">") {
             name = Some(new_name.to_string());
         } else {
-            let symbols = line.chars().map(Symbol::from).collect::<Vec<_>>();
+            let symbols = line_trimmed.chars().map(Symbol::from).collect::<Vec<_>>();
 
             sequences.push(Sequence {
                 name: name.take(),
@@ -280,11 +255,16 @@ pub fn read_fasta<P: AsRef<Path>>(path: P) -> Result<MultiSequence, std::io::Err
         }
     }
 
-    Ok(MultiSequence { source, sequences })
+    Ok(sequences)
 }
 
 /// Given a slice of all symbols in a site, should the site be considered for further computations
-pub fn is_site_of_interest(site: &[Symbol], min_acgt: usize, min_minor: f32, max_minor: f32) -> bool {
+pub fn is_site_of_interest(
+    site: &[Symbol],
+    min_acgt: usize,
+    min_minor: f32,
+    max_minor: f32,
+) -> bool {
     let hist = SymbolHistogram::from_slice(site);
 
     let acgt_count = hist.acgt();
@@ -572,6 +552,28 @@ mod tests {
     use approx::*;
 
     #[test]
+    fn test_read_fasta() {
+        use Symbol::*;
+
+        let example_input = r#">a1
+            ACGT
+            >a2
+            AC-T
+            >b1
+            wkdf
+            >b2
+            ----"#;
+            
+        let sequences = read_fasta(example_input.as_bytes())
+            .expect("Example fasta didn't parse");
+        
+        assert_eq!(sequences[0].symbols[..], [A, C, G, T]);
+        assert_eq!(sequences[1].symbols[..], [A, C, Missing, T]);
+        assert_eq!(sequences[2].symbols[..], [Unknown, Unknown, Unknown, Unknown]);
+        assert_eq!(sequences[3].symbols[..], [Missing, Missing, Missing, Missing]);
+    }
+
+    #[test]
     fn test_histogram_from_slice() {
         use Symbol::*;
         let a = [A, A, A, C, C, G, T, T, T, T, Missing, Missing, Unknown];
@@ -621,7 +623,11 @@ mod tests {
     fn test_henikoff_weights_2() {
         // as in S.F. Altschul NIH
         let siteset = SiteSet::from_strs(&["GCGTTAGC", "GAGTTGGA", "CGGACTAA"]);
-        assert_abs_diff_eq!(henikoff_weights(&siteset)[..], [0.769, 0.692, 1.0], epsilon = 0.001); // todo ever so slightly off could be float point error
+        assert_abs_diff_eq!(
+            henikoff_weights(&siteset)[..],
+            [0.769, 0.692, 1.0],
+            epsilon = 0.001
+        ); // todo ever so slightly off could be float point error
     }
 
     #[test]
@@ -629,15 +635,19 @@ mod tests {
         // ensure that indels are treated equally - seq 2 is most unique
         // 0.9166 , 1.25, 0.9166, 0.9166 -> 0.7333, 1, 0.7333, 0.7333
         let siteset = SiteSet::from_strs(&["AAGA", "AA-A", "GGGG", "GGGG"]);
-        assert_abs_diff_eq!(henikoff_weights(&siteset)[..], [0.733, 1.0, 0.733, 0.733], epsilon = 0.001); // todo handle assert nearly equal
+        assert_abs_diff_eq!(
+            henikoff_weights(&siteset)[..],
+            [0.733, 1.0, 0.733, 0.733],
+            epsilon = 0.001
+        ); // todo handle assert nearly equal
     }
 
     #[test]
     fn test_ld_pair_unweighted_ld0() {
         use Symbol::*;
-        let a = [A, A, A, A, T, T, T, T ];
-        let b = [T, T, A, A, A, A, T, T ];
-        let weights = [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0];
+        let a = [A, A, A, A, T, T, T, T];
+        let b = [T, T, A, A, A, A, T, T];
+        let weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 
         let ld_stats = single_weighted_ld_pair(&a, &b, &weights)
             .expect("Expected test case to have LD statistics available");
@@ -650,20 +660,21 @@ mod tests {
     #[test]
     fn test_ld_pair_unweighted_ld1() {
         use Symbol::*;
-        let a = [A, A, A, A, T, T, T, T ];
-        let b = [T, T, T, T, A, A, A, A ];
-        let weights = [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0];
+        let a = [A, A, A, A, T, T, T, T];
+        let b = [T, T, T, T, A, A, A, A];
+        let weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 
         let ld_stats = single_weighted_ld_pair(&a, &b, &weights)
             .expect("Expected test case to have LD statistics available");
-        println!("{}",&ld_stats.d);
+        println!("{}", &ld_stats.d);
         assert_abs_diff_eq!(ld_stats.d, 0.25, epsilon = 1e-5);
         assert_abs_diff_eq!(ld_stats.d_prime, 0.5, epsilon = 1e-5);
         assert_abs_diff_eq!(ld_stats.r2, 1.0, epsilon = 1e-5);
     }
 
     #[test]
-    fn test_single_weighted_ld_pair() { //todo paper and pen this example as a sanity check
+    fn test_single_weighted_ld_pair() {
+        //todo paper and pen this example as a sanity check
         use Symbol::*;
         let a = [A, A, A, A, C, A, C];
         let b = [A, A, A, G, T, A, A];
