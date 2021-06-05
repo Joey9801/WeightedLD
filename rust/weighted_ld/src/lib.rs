@@ -258,6 +258,103 @@ pub fn read_fasta(reader: impl Read) -> Result<Vec<Sequence>, std::io::Error> {
     Ok(sequences)
 }
 
+pub enum ReadVcfError {
+    /// The VCF file was missing a line that started "#CHROM\tPOS\t...."
+    MissingHeader,
+    
+    /// There was a line in the file that had fewer tab separated fields than expected
+    MissingColumn,
+    
+    /// One of the numeric fields wasn't a number
+    NotANumber,
+    
+    /// There was some non-ascii data
+    NotAscii,
+    
+    /// Some other IO error
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for ReadVcfError {
+    fn from(v: std::io::Error) -> Self {
+        Self::Io(v)
+    }
+}
+
+fn read_single_vcf_site(line: &str, site_set: &mut SiteSet) -> Result<(), ReadVcfError> {
+    let mut fields = line.split('\t');
+    
+    let _chrom = fields.next().ok_or(ReadVcfError::MissingColumn)?;
+    
+    // The site index of the first site represented by this line
+    let base_pos: usize = fields
+        .next()
+        .ok_or(ReadVcfError::MissingColumn)?
+        .parse()
+        .map_err(|_| ReadVcfError::NotANumber)?;
+        
+    let _id = fields.next().ok_or(ReadVcfError::MissingColumn)?;
+    let _ref = fields.next().ok_or(ReadVcfError::MissingColumn)?;
+    let _alt = fields.next().ok_or(ReadVcfError::MissingColumn)?;
+    
+    // Skip over QUAL, FILTER, INFO, and FORMAT
+    for _ in 0..4 {
+        fields.next().ok_or(ReadVcfError::MissingColumn)?;
+    }
+    
+    for (seq_idx, data) in fields.enumerate() {
+        
+    }
+
+    todo!();
+    Ok(())
+}
+
+pub fn read_vcf(reader: impl Read) -> Result<SiteSet, ReadVcfError> {
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    // loop until we get to the header line, then work out the sequence count from that
+    let n_seqs = loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            return Err(ReadVcfError::MissingHeader)
+        }
+        
+        if line.starts_with("#CHROM") {
+            // The header line is tab separated. There are 7 tabs between the
+            // mandatory fixed columns, then one more just before each of the
+            // sequence names
+            break line.chars()
+                .filter(|c| *c == '\t')
+                .count() - 7;
+        }
+    };
+    
+    let mut site_set = SiteSet {
+        n_seqs,
+        n_sites: 0,
+        buffer: Vec::new(),
+        site_map: Some(Vec::new()),
+    };
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        
+        if line.starts_with("#") {
+            continue;
+        }
+        read_single_vcf_site(&line, &mut site_set)?;
+    }
+
+    todo!()
+}
+
 /// Given a slice of all symbols in a site, should the site be considered for further computations
 pub fn is_site_of_interest(
     site: &[Symbol],
@@ -571,6 +668,34 @@ mod tests {
         assert_eq!(sequences[1].symbols[..], [A, C, Missing, T]);
         assert_eq!(sequences[2].symbols[..], [Unknown, Unknown, Unknown, Unknown]);
         assert_eq!(sequences[3].symbols[..], [Missing, Missing, Missing, Missing]);
+    }
+    
+    #[test]
+    fn test_read_vcf() {
+        let example_input = r#"##fileformat=VCFv4.0
+##fileDate=20090805
+##source=myImputationProgramV3.1
+##reference=1000GenomesPilot-NCBI36
+##phasing=partial
+##INFO=<ID=NS,Number=1,Type=Integer,Description="Number of Samples With Data">
+##INFO=<ID=DP,Number=1,Type=Integer,Description="Total Depth">
+##INFO=<ID=AF,Number=.,Type=Float,Description="Allele Frequency">
+##INFO=<ID=AA,Number=1,Type=String,Description="Ancestral Allele">
+##INFO=<ID=DB,Number=0,Type=Flag,Description="dbSNP membership, build 129">
+##INFO=<ID=H2,Number=0,Type=Flag,Description="HapMap2 membership">
+##FILTER=<ID=q10,Description="Quality below 10">
+##FILTER=<ID=s50,Description="Less than 50% of samples have data">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype Quality">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read Depth">
+##FORMAT=<ID=HQ,Number=2,Type=Integer,Description="Haplotype Quality">
+#CHROM POS     ID        REF ALT    QUAL FILTER INFO                              FORMAT      NA00001        NA00002        NA00003
+20     14370   rs6054257 G      A       29   PASS   NS=3;DP=14;AF=0.5;DB;H2           GT:GQ:DP:HQ 0|0:48:1:51,51 1|0:48:8:51,51 1/1:43:5:.,.
+20     17330   .         T      A       3    q10    NS=3;DP=11;AF=0.017               GT:GQ:DP:HQ 0|0:49:3:58,50 0|1:3:5:65,3   0/0:41:3
+20     1110696 rs6040355 A      G,T     67   PASS   NS=2;DP=10;AF=0.333,0.667;AA=T;DB GT:GQ:DP:HQ 1|2:21:6:23,27 2|1:2:0:18,2   2/2:35:4
+20     1230237 .         T      .       47   PASS   NS=3;DP=13;AA=T                   GT:GQ:DP:HQ 0|0:54:7:56,60 0|0:48:4:51,51 0/0:61:2
+20     1234567 microsat1 GTCT   G,GTACT 50   PASS   NS=3;DP=9;AA=G                    GT:GQ:DP    0/1:35:4       0/2:17:2       1/1:40:3"#;
+
     }
 
     #[test]
