@@ -131,6 +131,7 @@ pub struct Sequence {
 }
 
 /// Stores symbol data such that all data for a given site is contiguous
+#[derive(Debug)]
 pub struct SiteSet {
     n_sites: usize,
     n_seqs: usize,
@@ -226,6 +227,12 @@ impl SiteSet {
     pub fn parent_site_index(&self, idx: usize) -> usize {
         self.site_map.as_ref().map(|m| m[idx]).unwrap_or(idx)
     }
+
+    fn set(&mut self, site_idx: usize, seq_idx: usize, value: Symbol) {
+        assert!(site_idx < self.n_sites);
+        assert!(seq_idx  < self.n_seqs);
+        self.buffer[site_idx * self.n_seqs + seq_idx] = value;
+    }
 }
 
 pub fn read_fasta(reader: impl Read) -> Result<Vec<Sequence>, std::io::Error> {
@@ -240,7 +247,7 @@ pub fn read_fasta(reader: impl Read) -> Result<Vec<Sequence>, std::io::Error> {
         if bytes_read == 0 {
             break;
         }
-        
+
         let line_trimmed = line.trim();
 
         if let Some(new_name) = line_trimmed.strip_prefix(">") {
@@ -258,19 +265,22 @@ pub fn read_fasta(reader: impl Read) -> Result<Vec<Sequence>, std::io::Error> {
     Ok(sequences)
 }
 
+#[derive(Debug)]
 pub enum ReadVcfError {
     /// The VCF file was missing a line that started "#CHROM\tPOS\t...."
     MissingHeader,
-    
+
     /// There was a line in the file that had fewer tab separated fields than expected
     MissingColumn,
-    
+
     /// One of the numeric fields wasn't a number
     NotANumber,
-    
+
     /// There was some non-ascii data
     NotAscii,
-    
+
+    BadGenotypeEntry,
+
     /// Some other IO error
     Io(std::io::Error),
 }
@@ -281,32 +291,92 @@ impl From<std::io::Error> for ReadVcfError {
     }
 }
 
-fn read_single_vcf_site(line: &str, site_set: &mut SiteSet) -> Result<(), ReadVcfError> {
-    let mut fields = line.split('\t');
-    
+fn read_single_vcf_record(line: &str, site_set: &mut SiteSet) -> Result<(), ReadVcfError> {
+    let mut fields = line.split_ascii_whitespace();
+
     let _chrom = fields.next().ok_or(ReadVcfError::MissingColumn)?;
-    
+
     // The site index of the first site represented by this line
     let base_pos: usize = fields
         .next()
         .ok_or(ReadVcfError::MissingColumn)?
         .parse()
         .map_err(|_| ReadVcfError::NotANumber)?;
-        
+
     let _id = fields.next().ok_or(ReadVcfError::MissingColumn)?;
-    let _ref = fields.next().ok_or(ReadVcfError::MissingColumn)?;
-    let _alt = fields.next().ok_or(ReadVcfError::MissingColumn)?;
-    
+
+    let ref_str = fields.next().ok_or(ReadVcfError::MissingColumn)?;
+    let ref_syms = ref_str.chars().map(Symbol::from).collect::<Vec<_>>();
+
+    let alt_str = fields.next().ok_or(ReadVcfError::MissingColumn)?;
+    let alt_syms = alt_str
+        .split(',')
+        .map(|alt_str| alt_str.chars().map(Symbol::from).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    // The number of sites represented by this VCF record
+    let record_len = std::cmp::max(
+        ref_syms.len(),
+        alt_syms.iter().map(|a| a.len()).max().unwrap_or(0),
+    );
+
     // Skip over QUAL, FILTER, INFO, and FORMAT
     for _ in 0..4 {
         fields.next().ok_or(ReadVcfError::MissingColumn)?;
     }
-    
-    for (seq_idx, data) in fields.enumerate() {
-        
+
+    // Grow the site set buffer by enough that the below indexing will never fail, filling the
+    // empty space with "Missing" symbols
+    let base_site_idx = site_set.n_sites;
+    site_set.buffer.extend(std::iter::repeat(Symbol::Missing).take(record_len * site_set.n_seqs * 2));
+    site_set.n_sites += record_len;
+    for site_idx in base_pos..(base_pos + record_len) {
+        site_set.site_map.as_mut().unwrap().push(site_idx);
     }
 
-    todo!();
+    for (seq_idx, data) in fields.enumerate() {
+        let mut chars = data.chars();
+        let strand_a = chars
+            .next()
+            .ok_or(ReadVcfError::BadGenotypeEntry)?;
+        
+        let strand_a_data = match strand_a {
+            '0' => &ref_syms,
+            '1' => &alt_syms[0],
+            '2' => &alt_syms[1],
+            '3' => &alt_syms[2],
+            _ => return Err(ReadVcfError::BadGenotypeEntry),
+        };
+        
+        for (site_idx, sym) in strand_a_data.iter().enumerate() {
+            site_set.set(base_site_idx + site_idx, seq_idx * 2, *sym);
+        }
+        
+        let sep = chars
+            .next()
+            .ok_or(ReadVcfError::BadGenotypeEntry)?;
+
+        if sep != '|' && sep != '/' {
+            return Err(ReadVcfError::BadGenotypeEntry);
+        }
+
+        let strand_b = chars
+            .next()
+            .ok_or(ReadVcfError::BadGenotypeEntry)?;
+        
+        let strand_b_data = match strand_b {
+            '0' => &ref_syms,
+            '1' => &alt_syms[0],
+            '2' => &alt_syms[1],
+            '3' => &alt_syms[2],
+            _ => return Err(ReadVcfError::BadGenotypeEntry),
+        };
+        
+        for (site_idx, sym) in strand_b_data.iter().enumerate() {
+            site_set.set(base_site_idx + site_idx, seq_idx * 2 + 1, *sym);
+        }
+    }
+    
     Ok(())
 }
 
@@ -319,19 +389,17 @@ pub fn read_vcf(reader: impl Read) -> Result<SiteSet, ReadVcfError> {
         line.clear();
         let bytes_read = reader.read_line(&mut line)?;
         if bytes_read == 0 {
-            return Err(ReadVcfError::MissingHeader)
+            return Err(ReadVcfError::MissingHeader);
         }
-        
+
         if line.starts_with("#CHROM") {
-            // The header line is tab separated. There are 7 tabs between the
-            // mandatory fixed columns, then one more just before each of the
-            // sequence names
-            break line.chars()
-                .filter(|c| *c == '\t')
-                .count() - 7;
+            // If there is genotype information available, this line will have 9 headers before the
+            // sequence name headers (8 manadatory + FORMAT).
+            // Each sequence will generate two "sequences" in the SiteSet, one for each strand
+            break (line.split_ascii_whitespace().count() - 9) * 2;
         }
     };
-    
+
     let mut site_set = SiteSet {
         n_seqs,
         n_sites: 0,
@@ -345,14 +413,14 @@ pub fn read_vcf(reader: impl Read) -> Result<SiteSet, ReadVcfError> {
         if bytes_read == 0 {
             break;
         }
-        
+
         if line.starts_with("#") {
             continue;
         }
-        read_single_vcf_site(&line, &mut site_set)?;
+        read_single_vcf_record(&line, &mut site_set)?;
     }
-
-    todo!()
+    
+    Ok(site_set)
 }
 
 /// Given a slice of all symbols in a site, should the site be considered for further computations
@@ -660,18 +728,25 @@ mod tests {
             wkdf
             >b2
             ----"#;
-            
-        let sequences = read_fasta(example_input.as_bytes())
-            .expect("Example fasta didn't parse");
-        
+
+        let sequences = read_fasta(example_input.as_bytes()).expect("Example fasta didn't parse");
+
         assert_eq!(sequences[0].symbols[..], [A, C, G, T]);
         assert_eq!(sequences[1].symbols[..], [A, C, Missing, T]);
-        assert_eq!(sequences[2].symbols[..], [Unknown, Unknown, Unknown, Unknown]);
-        assert_eq!(sequences[3].symbols[..], [Missing, Missing, Missing, Missing]);
+        assert_eq!(
+            sequences[2].symbols[..],
+            [Unknown, Unknown, Unknown, Unknown]
+        );
+        assert_eq!(
+            sequences[3].symbols[..],
+            [Missing, Missing, Missing, Missing]
+        );
     }
-    
+
     #[test]
     fn test_read_vcf() {
+        use Symbol::*;
+
         let example_input = r#"##fileformat=VCFv4.0
 ##fileDate=20090805
 ##source=myImputationProgramV3.1
@@ -695,7 +770,36 @@ mod tests {
 20     1110696 rs6040355 A      G,T     67   PASS   NS=2;DP=10;AF=0.333,0.667;AA=T;DB GT:GQ:DP:HQ 1|2:21:6:23,27 2|1:2:0:18,2   2/2:35:4
 20     1230237 .         T      .       47   PASS   NS=3;DP=13;AA=T                   GT:GQ:DP:HQ 0|0:54:7:56,60 0|0:48:4:51,51 0/0:61:2
 20     1234567 microsat1 GTCT   G,GTACT 50   PASS   NS=3;DP=9;AA=G                    GT:GQ:DP    0/1:35:4       0/2:17:2       1/1:40:3"#;
+        
+        let site_set = read_vcf(example_input.as_bytes())
+            .expect("Expected that valid VCF input would parse");
+        
+        // Two "sequences" for each sequence, one for each strand
+        assert_eq!(site_set.n_seqs, 6);
+        assert_eq!(site_set.n_sites, 9);
+        
+        assert_eq!(site_set.parent_site_index(0), 14370);
+        assert_eq!(&site_set[0], &[G, G, A, G, A, A]);
 
+        assert_eq!(site_set.parent_site_index(1), 17330);
+        assert_eq!(&site_set[1], &[T, T, T, A, T, T]);
+
+        assert_eq!(site_set.parent_site_index(2), 1110696);
+        assert_eq!(&site_set[2], &[G, T, T, G, T, T]);
+
+        assert_eq!(site_set.parent_site_index(3), 1230237);
+        assert_eq!(&site_set[3], &[T, T, T, T, T, T]);
+
+        assert_eq!(site_set.parent_site_index(4), 1234567);
+        assert_eq!(&site_set[4], &[G, G, G, G, G, G]);
+        assert_eq!(site_set.parent_site_index(5), 1234568);
+        assert_eq!(&site_set[5], &[T, Missing, T, T, Missing, Missing]);
+        assert_eq!(site_set.parent_site_index(6), 1234569);
+        assert_eq!(&site_set[6], &[C, Missing, C, A, Missing, Missing]);
+        assert_eq!(site_set.parent_site_index(7), 1234570);
+        assert_eq!(&site_set[7], &[T, Missing, T, C, Missing, Missing]);
+        assert_eq!(site_set.parent_site_index(8), 1234571);
+        assert_eq!(&site_set[8], &[Missing, Missing, Missing, T, Missing, Missing]);
     }
 
     #[test]
